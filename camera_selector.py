@@ -1,120 +1,201 @@
 import cv2
 import time
+import os
+import numpy as np
+import requests
 
-def scan_cameras(max_check=5):
-    """Scan and return list of available camera indices."""
+os.environ["OPENCV_LOG_LEVEL"] = "ERROR"
+
+# IP_WEBCAM_BASE = "http://192.168.1.4:8080"
+IP_WEBCAM_BASE = "http://192.168.1.6:8080"
+PHONE_ROTATION = 1  # 90 counter-clockwise — change if still sideways
+
+
+def rotate_frame(frame, rotation):
+    if rotation == 1:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    elif rotation == 2:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    elif rotation == 3:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
+
+class IPWebcamStream:
+    """
+    Reads frames from IP Webcam using the /shot.jpg endpoint.
+    This grabs one JPEG at a time — much more stable than streaming.
+    No boundary errors, no freezing.
+    """
+    def __init__(self, base_url):
+        self.url     = f"{base_url}/shot.jpg"
+        self.session = requests.Session()
+        self.session.timeout = 2.0
+
+    def read(self):
+        try:
+            resp = self.session.get(self.url, timeout=2.0)
+            if resp.status_code == 200:
+                arr   = np.frombuffer(resp.content, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    return True, frame
+        except Exception:
+            pass
+        return False, None
+
+    def get(self, prop):
+        # Fake CAP_PROP values so it behaves like cv2.VideoCapture
+        return 0
+
+    def set(self, prop, val):
+        pass
+
+    def isOpened(self):
+        ret, _ = self.read()
+        return ret
+
+    def release(self):
+        self.session.close()
+
+
+def test_ip_webcam(base_url):
+    """Test if IP Webcam is reachable and returning frames."""
+    try:
+        url  = f"{base_url}/shot.jpg"
+        resp = requests.get(url, timeout=3.0)
+        if resp.status_code == 200:
+            arr   = np.frombuffer(resp.content, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is not None:
+                return IPWebcamStream(base_url), frame.shape[1], frame.shape[0]
+    except Exception:
+        pass
+    return None, 0, 0
+
+
+def scan_local_cameras(max_check=3):
     available = []
     for i in range(max_check):
-        cap = cv2.VideoCapture(i)          # no DSHOW — avoids Windows C++ exception
+        cap = cv2.VideoCapture(i)
         if cap.isOpened():
             ret, frame = cap.read()
             if ret and frame is not None:
-                available.append(i)
-            cap.release()
-        time.sleep(0.1)
+                available.append((i, cap))
+            else:
+                cap.release()
+        time.sleep(0.05)
     return available
 
-def get_camera_label(index):
-    """Try to give a human-friendly label for each camera index."""
-    # Index 0 is almost always the built-in laptop webcam
-    # DroidCam usually appears as index 1 or 2
-    if index == 0:
-        return "Laptop built-in camera"
-    else:
-        return f"External / DroidCam camera (index {index})"
 
 def select_camera():
-    """
-    Scan available cameras, show a menu, let user pick one.
-    Returns an open cv2.VideoCapture object ready to use.
-    """
     print("\n" + "="*50)
     print("   EYE MOUSE — CAMERA SETUP")
     print("="*50)
-    print("\nScanning for available cameras, please wait...\n")
 
-    cameras = scan_cameras()
+    options = []
 
-    if not cameras:
-        print("[ERROR] No cameras found!")
-        print("  - Make sure your laptop webcam is not blocked.")
-        print("  - If using DroidCam, open the app on your phone first,")
-        print("    then connect via WiFi or USB before running this script.")
-        input("\nPress Enter to exit.")
+    # Check phone camera
+    print("\nChecking IP Webcam (phone camera)...")
+    stream, w, h = test_ip_webcam(IP_WEBCAM_BASE)
+    if stream is not None:
+        options.append(("phone", stream, f"Phone camera {w}x{h} via IP Webcam (RECOMMENDED)"))
+        print(f"  [OK] Phone camera connected! Resolution: {w}x{h}")
+    else:
+        print("  [X] Phone camera not reachable")
+        print("      Make sure IP Webcam app is running and on same WiFi")
+
+    # Check laptop camera
+    print("\nChecking laptop camera...")
+    local_cams = scan_local_cameras()
+    added = False
+    for idx, cap in local_cams:
+        if not added:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            options.append(("local", cap, "Laptop built-in camera (640x480)"))
+            added = True
+            print(f"  [OK] Laptop camera found (index {idx})")
+        else:
+            cap.release()
+
+    if not options:
+        print("\n[ERROR] No cameras found!")
+        input("Press Enter to exit.")
         return None
 
-    print(f"Found {len(cameras)} camera(s):\n")
-    for idx, cam_index in enumerate(cameras):
-        label = get_camera_label(cam_index)
-        print(f"  [{idx + 1}] {label}")
-
+    print(f"\nFound {len(options)} camera(s):\n")
+    for i, (_, _, label) in enumerate(options):
+        print(f"  [{i+1}] {label}")
     print()
 
-    # If only one camera found, auto-select it
-    if len(cameras) == 1:
-        print(f"Only one camera found. Auto-selecting: {get_camera_label(cameras[0])}")
+    if len(options) == 1:
         choice = 0
+        print(f"Auto-selecting: {options[0][2]}")
     else:
         while True:
             try:
-                raw = input(f"Enter your choice (1 to {len(cameras)}): ").strip()
+                raw    = input(f"Enter your choice (1 to {len(options)}): ").strip()
                 choice = int(raw) - 1
-                if 0 <= choice < len(cameras):
+                if 0 <= choice < len(options):
                     break
-                else:
-                    print(f"  Please enter a number between 1 and {len(cameras)}.")
+                print(f"  Enter a number between 1 and {len(options)}.")
             except ValueError:
-                print("  Invalid input. Please enter a number.")
+                print("  Invalid input.")
 
-    selected_index = cameras[choice]
-    label = get_camera_label(selected_index)
+    kind, cap, label = options[choice]
 
-    print(f"\nOpening: {label} ...")
-    cap = cv2.VideoCapture(selected_index)   # no DSHOW — cleaner on Windows
+    # Release cameras we didn't pick
+    for i, (_, c, _) in enumerate(options):
+        if i != choice:
+            c.release()
 
-    # Set a decent resolution
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-
-    if not cap.isOpened():
-        print(f"[ERROR] Could not open camera index {selected_index}.")
-        print("  Try closing other apps that might be using the camera.")
-        input("\nPress Enter to exit.")
-        return None
-
-    # Quick test — grab a frame to confirm it works
-    ret, frame = cap.read()
-    if not ret or frame is None:
-        print("[ERROR] Camera opened but could not read a frame.")
-        print("  If using DroidCam, make sure the phone app is running")
-        print("  and both devices are on the same WiFi network.")
-        cap.release()
-        input("\nPress Enter to exit.")
-        return None
-
-    print(f"\n[OK] Camera ready! Resolution: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
+    print(f"\n[OK] Camera ready: {label}")
     print("="*50 + "\n")
+    return cap, kind
 
-    return cap, selected_index
 
-
-# ── Quick test — run this file directly to check your cameras ──
+# ── Quick test ────────────────────────────────────────────────────
 if __name__ == "__main__":
     result = select_camera()
-    if result is not None:
-        cap, index = result
-        print("Camera test: showing live feed for 5 seconds...")
-        print("Press Q to quit early.\n")
-        start = time.time()
-        while time.time() - start < 5:
-            ret, frame = cap.read()
-            if ret:
-                frame = cv2.flip(frame, 1)   # 1 = horizontal flip, fixes mirror
-                cv2.imshow("Camera Test - Press Q to quit", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        cap.release()
-        cv2.destroyAllWindows()
-        print("Camera test done. Everything is working!")
-    input("\nPress Enter to close.")
+    if result is None:
+        exit()
+
+    cap, kind = result
+    rotation  = PHONE_ROTATION
+
+    print("Live feed — R=rotate  Q=quit\n")
+
+    while True:
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            time.sleep(0.03)
+            continue
+
+        if kind == "phone":
+            frame = rotate_frame(frame, rotation)
+
+        frame = cv2.flip(frame, 1)
+
+        h, w = frame.shape[:2]
+        cv2.putText(frame, f"Rotation: {rotation*90} deg  R=rotate  Q=quit",
+                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        display = cv2.resize(frame, (960, 540)) if w > 960 else frame
+        cv2.imshow("Camera Test", display)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('r'):
+            rotation = (rotation + 1) % 4
+            print(f"Rotation: {rotation*90} degrees")
+        elif key == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    if rotation != PHONE_ROTATION:
+        print(f"\nUpdate PHONE_ROTATION = {rotation} in camera_selector.py")
+    else:
+        print("\nRotation is good!")
+    input("Press Enter to close.")
